@@ -24,22 +24,29 @@ def pad():
     pygame.joystick.init()
     print("Press buttons, D-pad, move sticks. Ctrl+C to quit.")
     last_axis = {}
+    joysticks = {}  # instance_id -> Joystick, kept referenced so SDL keeps it open
     while True:
         for event in pygame.event.get():
             if event.type == pygame.JOYDEVICEADDED:
                 js = pygame.joystick.Joystick(event.device_index)
+                joysticks[js.get_instance_id()] = js
                 print(f"Controller: {js.get_name()} "
                       f"({js.get_numbuttons()} buttons, {js.get_numaxes()} axes, {js.get_numhats()} hats)")
-            elif event.type == pygame.JOYBUTTONDOWN:
-                print(f"button {event.button}")
-            elif event.type == pygame.JOYHATMOTION:
-                print(f"hat {event.value}")
-            elif event.type == pygame.JOYAXISMOTION:
-                # only print big moves so the stream stays readable
-                v = round(event.value, 1)
-                if abs(v) >= 0.5 and last_axis.get(event.axis) != v:
-                    print(f"axis {event.axis}: {v:+.1f}")
-                last_axis[event.axis] = v
+            elif event.type == pygame.JOYDEVICEREMOVED:
+                joysticks.pop(event.instance_id, None)
+            elif hasattr(event, "instance_id") and event.instance_id in joysticks:
+                name = joysticks[event.instance_id].get_name()
+                if event.type == pygame.JOYBUTTONDOWN:
+                    print(f"[{name}] button {event.button}")
+                elif event.type == pygame.JOYHATMOTION:
+                    print(f"[{name}] hat {event.value}")
+                elif event.type == pygame.JOYAXISMOTION:
+                    # only print big moves so the stream stays readable
+                    v = round(event.value, 1)
+                    key = (event.instance_id, event.axis)
+                    if abs(v) >= 0.5 and last_axis.get(key) != v:
+                        print(f"[{name}] axis {event.axis}: {v:+.1f}")
+                    last_axis[key] = v
         time.sleep(0.005)
 
 

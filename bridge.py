@@ -35,13 +35,18 @@ KNOB_CCS = (74, 71, 76, 77, 93, 18, 19, 16)
 # DualSense
 NAV_CHANNEL = 15  # MIDI channel 16, keeps clear of the MiniLab on channel 1
 VELOCITY = 100
-TRACK_PREV_NOTE = 120
-TRACK_NEXT_NOTE = 121
+TRACK_PREV_NOTE = 120   # stick up
+TRACK_NEXT_NOTE = 121   # stick down
+TRACK_LEFT_NOTE = 125   # stick left
+TRACK_RIGHT_NOTE = 126  # stick right
 REFRESH_NOTE = 122
+TOGGLE_NOTE = 123  # Circle: toggle the selected track's instrument on/off
+HOLD_NOTE = 124    # Triangle: instrument on while held, off on release
 COLOR_CCS = (20, 21, 22)  # R, G, B
 IDLE_COLOR = (0, 0, 40)   # lightbar until Live reports a track color
 LED_BRIGHTNESS = 1.0
 
+LEFT_STICK_X = 0   # left is negative
 LEFT_STICK_Y = 1   # up is negative
 RIGHT_STICK_Y = 3  # up is negative
 
@@ -53,12 +58,37 @@ VOLUME_INTERVAL = 0.02
 TRIGGER = 0.6      # stick past this fires a tap
 REARM = 0.3        # stick must return inside this before the next tap
 
+# Xbox controller: transport + scene navigation. Sent on its own channel so it can't
+# collide with the DualSense.
+XBOX_CHANNEL = 14  # MIDI channel 15
+PLAY_NOTE = 0
+PAUSE_NOTE = 1
+STOP_NOTE = 2
+SCENE_LAUNCH_NOTE = 3
+SCENE_UP_NOTE = 4
+SCENE_DOWN_NOTE = 5
+STOP_TRACK_NOTE = 6
+XBOX_LEFT_STICK_Y = 1  # up is negative
+
+# Controllers are told apart by name. Anything else is ignored.
+DUALSENSE_NAMES = ("dualsense", "ps5", "playstation")
+XBOX_NAMES = ("xbox", "x-box")
+
 # Indices from tools/discover.py; edit if your driver reports different ones.
+XBOX_BUTTON_TO_NOTE = {
+    2: PLAY_NOTE,          # X
+    3: PAUSE_NOTE,         # Y
+    0: STOP_NOTE,          # A
+    1: SCENE_LAUNCH_NOTE,  # B
+    6: STOP_TRACK_NOTE,    # Back / View
+}
+
+# DualSense
 BUTTON_TO_NOTE = {
     0: 0,    # Cross
-    1: 1,    # Circle
+    1: TOGGLE_NOTE,  # Circle
     2: 2,    # Square
-    3: 3,    # Triangle
+    3: HOLD_NOTE,  # Triangle
     9: 64,   # L1
     10: 65,  # R1
     7: 68,   # L3
@@ -91,15 +121,15 @@ class Output:
         with self._lock:
             self._port.send(msg)
 
-    def note(self, note, on):
+    def note(self, note, on, channel=NAV_CHANNEL):
         self.send(mido.Message(
             "note_on" if on else "note_off",
-            note=note, velocity=VELOCITY if on else 0, channel=NAV_CHANNEL,
+            note=note, velocity=VELOCITY if on else 0, channel=channel,
         ))
 
-    def tap(self, note):
-        self.note(note, True)
-        self.note(note, False)
+    def tap(self, note, channel=NAV_CHANNEL):
+        self.note(note, True, channel)
+        self.note(note, False, channel)
 
     def close(self):
         self._port.close()
@@ -174,70 +204,144 @@ def open_minilab(out):
     return port
 
 
-def run(out, lightbar, feedback):
-    js = None
-    right_y = 0.0
-    last_volume_send = 0.0
-    stick_ready = True
-    last_hat = (0, 0)
+def classify(name):
+    lowered = name.lower()
+    if any(key in lowered for key in DUALSENSE_NAMES):
+        return "dualsense"
+    if any(key in lowered for key in XBOX_NAMES):
+        return "xbox"
+    return None
 
-    if pygame.joystick.get_count() == 0:
-        print("Waiting for DualSense...")
+
+class DualSenseState:
+    def __init__(self):
+        self.left_x = 0.0
+        self.left_y = 0.0
+        self.right_y = 0.0
+        self.last_volume_send = 0.0
+        self.stick_ready = True
+        self.last_hat = (0, 0)
+
+
+def handle_dualsense(event, state, out):
+    if event.type in (pygame.JOYBUTTONDOWN, pygame.JOYBUTTONUP):
+        note = BUTTON_TO_NOTE.get(event.button)
+        if note is not None:
+            out.note(note, event.type == pygame.JOYBUTTONDOWN)
+
+    elif event.type == pygame.JOYHATMOTION:
+        old_note = HAT_TO_NOTE.get(state.last_hat)
+        new_note = HAT_TO_NOTE.get(event.value)
+        if old_note is not None:
+            out.note(old_note, False)
+        if new_note is not None:
+            out.note(new_note, True)
+        state.last_hat = event.value
+
+    elif event.type == pygame.JOYAXISMOTION and event.axis == RIGHT_STICK_Y:
+        state.right_y = event.value
+
+    elif event.type == pygame.JOYAXISMOTION and event.axis in (LEFT_STICK_X, LEFT_STICK_Y):
+        # One step per flick; the stick must return to center before the next one.
+        # Vertical and horizontal flicks are sent separately: Live's script picks the one
+        # that applies to the visible view (arrangement = vertical, session = horizontal).
+        if event.axis == LEFT_STICK_X:
+            state.left_x = event.value
+        else:
+            state.left_y = event.value
+        strongest = max(abs(state.left_x), abs(state.left_y))
+        if strongest < REARM:
+            state.stick_ready = True
+        elif state.stick_ready and strongest > TRIGGER:
+            state.stick_ready = False
+            if abs(state.left_x) > abs(state.left_y):  # dominant axis wins on diagonals
+                note, label = (TRACK_LEFT_NOTE, "left") if state.left_x < 0 else (TRACK_RIGHT_NOTE, "right")
+            else:
+                note, label = (TRACK_PREV_NOTE, "up") if state.left_y < 0 else (TRACK_NEXT_NOTE, "down")
+            out.tap(note)
+            print(f"Stick {label}")
+
+
+class XboxState:
+    def __init__(self):
+        self.stick_ready = True
+
+
+def handle_xbox(event, state, out):
+    if event.type in (pygame.JOYBUTTONDOWN, pygame.JOYBUTTONUP):
+        note = XBOX_BUTTON_TO_NOTE.get(event.button)
+        if note is not None:
+            out.note(note, event.type == pygame.JOYBUTTONDOWN, XBOX_CHANNEL)
+
+    elif event.type == pygame.JOYAXISMOTION and event.axis == XBOX_LEFT_STICK_Y:
+        # One scene step per flick, same behaviour as the DualSense track stick
+        value = event.value
+        if abs(value) < REARM:
+            state.stick_ready = True
+        elif state.stick_ready and abs(value) > TRIGGER:
+            state.stick_ready = False
+            if value < 0:
+                out.tap(SCENE_UP_NOTE, XBOX_CHANNEL)
+                print("Scene up")
+            else:
+                out.tap(SCENE_DOWN_NOTE, XBOX_CHANNEL)
+                print("Scene down")
+
+
+def send_volume(state, out, now):
+    if abs(state.right_y) <= VOLUME_DEADZONE or now - state.last_volume_send < VOLUME_INTERVAL:
+        return
+    state.last_volume_send = now
+    # 0 at the edge of the deadzone, 1 at full deflection; up (negative) raises
+    amount = (abs(state.right_y) - VOLUME_DEADZONE) / (1.0 - VOLUME_DEADZONE)
+    direction = -1 if state.right_y > 0 else 1
+    value = 64 + direction * round(63 * min(1.0, amount))
+    out.send(mido.Message("control_change", control=VOLUME_CC, value=value, channel=NAV_CHANNEL))
+
+
+def run(out, lightbar, feedback):
+    joysticks = {}   # instance_id -> Joystick (must stay referenced or SDL closes it)
+    kinds = {}       # instance_id -> "dualsense" | "xbox"
+    dualsense = DualSenseState()
+    xbox = XboxState()
+
+    print("Waiting for controllers (DualSense, Xbox)...")
 
     while True:
         for event in pygame.event.get():
-            if event.type == pygame.JOYDEVICEADDED and js is None:
+            if event.type == pygame.JOYDEVICEADDED:
                 js = pygame.joystick.Joystick(event.device_index)
-                print(f"Controller: {js.get_name()}")
-                lightbar.attach(event.device_index)
-                lightbar.set(IDLE_COLOR)
-                out.tap(REFRESH_NOTE)  # ask Live for the current track color
+                kind = classify(js.get_name())
+                if kind is None or kind in kinds.values():
+                    print(f"Ignoring controller: {js.get_name()}")
+                    continue
+                joysticks[js.get_instance_id()] = js
+                kinds[js.get_instance_id()] = kind
+                print(f"{kind}: {js.get_name()}")
+                if kind == "dualsense":
+                    lightbar.attach(event.device_index)
+                    lightbar.set(IDLE_COLOR)
+                    out.tap(REFRESH_NOTE)  # ask Live for the current track color
 
-            elif event.type == pygame.JOYDEVICEREMOVED and js is not None \
-                    and event.instance_id == js.get_instance_id():
-                js = None
-                right_y = 0.0
-                lightbar.detach()
-                print("Controller disconnected. Waiting...")
+            elif event.type == pygame.JOYDEVICEREMOVED:
+                kind = kinds.pop(event.instance_id, None)
+                joysticks.pop(event.instance_id, None)
+                if kind == "dualsense":
+                    dualsense = DualSenseState()
+                    lightbar.detach()
+                elif kind == "xbox":
+                    xbox = XboxState()
+                if kind is not None:
+                    print(f"{kind} disconnected. Waiting...")
 
-            elif event.type in (pygame.JOYBUTTONDOWN, pygame.JOYBUTTONUP):
-                note = BUTTON_TO_NOTE.get(event.button)
-                if note is not None:
-                    out.note(note, event.type == pygame.JOYBUTTONDOWN)
+            elif hasattr(event, "instance_id"):
+                kind = kinds.get(event.instance_id)
+                if kind == "dualsense":
+                    handle_dualsense(event, dualsense, out)
+                elif kind == "xbox":
+                    handle_xbox(event, xbox, out)
 
-            elif event.type == pygame.JOYHATMOTION:
-                old_note = HAT_TO_NOTE.get(last_hat)
-                new_note = HAT_TO_NOTE.get(event.value)
-                if old_note is not None:
-                    out.note(old_note, False)
-                if new_note is not None:
-                    out.note(new_note, True)
-                last_hat = event.value
-
-            elif event.type == pygame.JOYAXISMOTION and event.axis == RIGHT_STICK_Y:
-                right_y = event.value
-
-            elif event.type == pygame.JOYAXISMOTION and event.axis == LEFT_STICK_Y:
-                value = event.value
-                if abs(value) < REARM:
-                    stick_ready = True
-                elif stick_ready and abs(value) > TRIGGER:
-                    stick_ready = False
-                    if value < 0:
-                        out.tap(TRACK_PREV_NOTE)
-                        print("Track previous")
-                    else:
-                        out.tap(TRACK_NEXT_NOTE)
-                        print("Track next")
-
-        now = time.monotonic()
-        if abs(right_y) > VOLUME_DEADZONE and now - last_volume_send >= VOLUME_INTERVAL:
-            last_volume_send = now
-            # 0 at the edge of the deadzone, 1 at full deflection; up (negative) raises
-            amount = (abs(right_y) - VOLUME_DEADZONE) / (1.0 - VOLUME_DEADZONE)
-            direction = -1 if right_y > 0 else 1
-            value = 64 + direction * round(63 * min(1.0, amount))
-            out.send(mido.Message("control_change", control=VOLUME_CC, value=value, channel=NAV_CHANNEL))
+        send_volume(dualsense, out, time.monotonic())
 
         color, feedback.pending = feedback.pending, None
         if color is not None:

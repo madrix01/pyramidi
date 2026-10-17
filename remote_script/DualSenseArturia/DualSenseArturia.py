@@ -26,9 +26,29 @@ PICKUP_TOLERANCE = 2  # knob units (0-127) counted as "reached the macro"
 
 # DualSense navigation (sent by bridge.py)
 NAV_CHANNEL = 15  # MIDI channel 16
-TRACK_PREV_NOTE = 120
-TRACK_NEXT_NOTE = 121
+# Left stick changes track: up/down in the arrangement view, left/right in the session view
+TRACK_PREV_NOTE = 120   # stick up
+TRACK_NEXT_NOTE = 121   # stick down
+TRACK_LEFT_NOTE = 125   # stick left
+TRACK_RIGHT_NOTE = 126  # stick right
 REFRESH_NOTE = 122  # bridge sends this on start-up so the lightbar syncs
+TOGGLE_NOTE = 123   # Circle: toggle the selected track's instrument on/off
+
+HOLD_NOTE = 124     # Triangle: instrument on while held, off on release
+
+# Xbox controller: transport + scene navigation (sent by bridge.py)
+XBOX_CHANNEL = 14  # MIDI channel 15
+PLAY_NOTE = 0
+PAUSE_NOTE = 1
+STOP_NOTE = 2
+SCENE_LAUNCH_NOTE = 3
+SCENE_UP_NOTE = 4
+SCENE_DOWN_NOTE = 5
+STOP_TRACK_NOTE = 6
+
+# What Circle switches: "device" = the rack's Device On (instrument only, effects after it
+# keep ringing out) or "track" = track mute (silences the whole track).
+TOGGLE_TARGET = "device"
 
 # Lightbar feedback: selected track's color as 3 CCs (7-bit each) on NAV_CHANNEL.
 # Needs the feedback port set as this script's Output in Live.
@@ -54,6 +74,7 @@ class DualSenseArturia(ControlSurface):
     def __init__(self, c_instance):
         super().__init__(c_instance)
         self._watched_track = None
+        self._held_device_on = None  # Device On parameter switched on by Triangle
         self._macros = [None] * len(KNOB_CCS)
         self._knob_pos = [None] * len(KNOB_CCS)   # last CC value seen per knob
         self._picked = [False] * len(KNOB_CCS)
@@ -84,17 +105,52 @@ class DualSenseArturia(ControlSurface):
         self._next_button = ButtonElement(True, MIDI_NOTE_TYPE, NAV_CHANNEL, TRACK_NEXT_NOTE)
         self._prev_button.add_value_listener(self._dsa_prev)
         self._next_button.add_value_listener(self._dsa_next)
+        self._left_button = ButtonElement(True, MIDI_NOTE_TYPE, NAV_CHANNEL, TRACK_LEFT_NOTE)
+        self._right_button = ButtonElement(True, MIDI_NOTE_TYPE, NAV_CHANNEL, TRACK_RIGHT_NOTE)
+        self._left_button.add_value_listener(self._dsa_left)
+        self._right_button.add_value_listener(self._dsa_right)
         self._refresh_button = ButtonElement(True, MIDI_NOTE_TYPE, NAV_CHANNEL, REFRESH_NOTE)
         self._refresh_button.add_value_listener(self._dsa_refresh)
+        self._toggle_button = ButtonElement(True, MIDI_NOTE_TYPE, NAV_CHANNEL, TOGGLE_NOTE)
+        self._toggle_button.add_value_listener(self._dsa_toggle)
+        self._hold_button = ButtonElement(True, MIDI_NOTE_TYPE, NAV_CHANNEL, HOLD_NOTE)
+        self._hold_button.add_value_listener(self._dsa_hold)
+
+        # Xbox controller buttons: (button, callback) pairs, kept for disconnect()
+        self._xbox_buttons = []
+        for note, callback in (
+            (PLAY_NOTE, self._dsa_play),
+            (PAUSE_NOTE, self._dsa_pause),
+            (STOP_NOTE, self._dsa_stop),
+            (SCENE_LAUNCH_NOTE, self._dsa_scene_launch),
+            (SCENE_UP_NOTE, lambda value: self._dsa_scene(-1, value)),
+            (SCENE_DOWN_NOTE, lambda value: self._dsa_scene(1, value)),
+            (STOP_TRACK_NOTE, self._dsa_stop_track),
+        ):
+            button = ButtonElement(True, MIDI_NOTE_TYPE, XBOX_CHANNEL, note)
+            button.add_value_listener(callback)
+            self._xbox_buttons.append((button, callback))
 
     # ---------- navigation ----------
 
+    def _session_visible(self):
+        return self.application().view.is_view_visible("Session")
+
+    # Vertical flicks only act in the arrangement view, horizontal only in the session view
     def _dsa_prev(self, value):
-        if value:
+        if value and not self._session_visible():
             self._move_track(-1)
 
     def _dsa_next(self, value):
-        if value:
+        if value and not self._session_visible():
+            self._move_track(1)
+
+    def _dsa_left(self, value):
+        if value and self._session_visible():
+            self._move_track(-1)
+
+    def _dsa_right(self, value):
+        if value and self._session_visible():
             self._move_track(1)
 
     def _dsa_volume(self, value):
@@ -102,6 +158,91 @@ class DualSenseArturia(ControlSurface):
         amount *= abs(amount)  # squared response: fine control near the center
         volume = self.song().view.selected_track.mixer_device.volume
         volume.value = max(volume.min, min(volume.max, volume.value + amount * VOLUME_FULL_STEP))
+
+    def _dsa_toggle(self, value):
+        if not value:
+            return
+        track = self.song().view.selected_track
+        if TOGGLE_TARGET == "track":
+            if not hasattr(track, "mute") or track == self.song().master_track:
+                self.show_message("%s: cannot mute" % track.name)
+                return
+            track.mute = not track.mute
+            self.show_message("%s: %s" % (track.name, "MUTED" if track.mute else "unmuted"))
+            return
+
+        rack = find_rack(track) if hasattr(track, "devices") else None
+        if rack is None:
+            self.show_message("%s: no rack to toggle" % track.name)
+            return
+        device_on = rack.parameters[0]
+        device_on.value = 0.0 if device_on.value >= 0.5 else 1.0
+        self.show_message("%s  |  %s: %s" % (
+            track.name, rack.name, "ON" if device_on.value >= 0.5 else "OFF"))
+
+    def _dsa_hold(self, value):
+        if value:
+            track = self.song().view.selected_track
+            rack = find_rack(track) if hasattr(track, "devices") else None
+            if rack is None:
+                self.show_message("%s: no rack to switch on" % track.name)
+                return
+            self._held_device_on = rack.parameters[0]
+            self._held_device_on.value = 1.0
+            self.show_message("%s  |  %s: ON (held)" % (track.name, rack.name))
+        elif self._held_device_on is not None:
+            # Switch off the rack we switched on, even if the track selection moved meanwhile
+            try:
+                self._held_device_on.value = 0.0
+            except RuntimeError:
+                pass  # device was deleted while held
+            self._held_device_on = None
+            self.show_message("Instrument OFF")
+
+    def _dsa_play(self, value):
+        if value and not self.song().is_playing:
+            self.song().continue_playing()
+            self.show_message("Play")
+
+    def _dsa_pause(self, value):
+        # Live has no true pause: this stops playback and keeps the position
+        if value and self.song().is_playing:
+            self.song().stop_playing()
+            self.show_message("Paused")
+
+    def _dsa_stop(self, value):
+        if value:
+            song = self.song()
+            song.stop_playing()
+            song.current_song_time = 0.0
+            self.show_message("Stopped")
+
+    def _dsa_scene(self, direction, value):
+        if not value:
+            return
+        song = self.song()
+        scenes = list(song.scenes)
+        try:
+            index = scenes.index(song.view.selected_scene)
+        except ValueError:
+            index = 0
+        index = max(0, min(len(scenes) - 1, index + direction))
+        song.view.selected_scene = scenes[index]
+        self.show_message("Scene %d: %s" % (index + 1, scenes[index].name))
+
+    def _dsa_scene_launch(self, value):
+        if value:
+            scene = self.song().view.selected_scene
+            scene.fire()
+            self.show_message("Launched scene: %s" % scene.name)
+
+    def _dsa_stop_track(self, value):
+        if not value:
+            return
+        track = self.song().view.selected_track
+        if hasattr(track, "stop_all_clips"):
+            track.stop_all_clips()
+            self.show_message("%s: clips stopped" % track.name)
 
     def _move_track(self, direction):
         song = self.song()
@@ -215,5 +356,11 @@ class DualSenseArturia(ControlSurface):
         self._volume_encoder.remove_value_listener(self._dsa_volume)
         self._prev_button.remove_value_listener(self._dsa_prev)
         self._next_button.remove_value_listener(self._dsa_next)
+        self._left_button.remove_value_listener(self._dsa_left)
+        self._right_button.remove_value_listener(self._dsa_right)
         self._refresh_button.remove_value_listener(self._dsa_refresh)
+        self._toggle_button.remove_value_listener(self._dsa_toggle)
+        self._hold_button.remove_value_listener(self._dsa_hold)
+        for button, callback in self._xbox_buttons:
+            button.remove_value_listener(callback)
         super().disconnect()
