@@ -68,6 +68,10 @@ TOGGLE_TARGET = "device"
 # Needs the feedback port set as this script's Output in Live.
 COLOR_CCS = (20, 21, 22)  # R, G, B
 
+# Phone display status, also on the feedback port: SysEx F0 7D <kind> <ASCII text> F7
+# (same format as display.py). Kinds: T selected track, P pinned track, V value change.
+STATUS_SYSEX_ID = 0x7D
+
 # Right stick -> selected track volume. Messages arrive ~50/s while the stick is held:
 # 64 = no movement, 127 = full up, 1 = full down. Volume spans 0.0-1.0 (0.85 = 0 dB).
 VOLUME_CC = 23
@@ -334,10 +338,20 @@ class DualSenseArturia(ControlSurface):
         self._watch_devices(track)
         self._show_rack(track)
         self._send_color(track)
+        self._send_status("T", track.name)
 
     def _dsa_refresh(self, value):
         if value:
-            self._send_color(self.song().view.selected_track)
+            track = self.song().view.selected_track
+            self._send_color(track)
+            self._send_status("T", track.name)
+            pinned = self._target_track("pinned")
+            self._send_status("P", pinned.name if pinned is not None else "")
+
+    def _send_status(self, kind, text):
+        # SysEx carries 7-bit bytes only: anything outside printable ASCII becomes "?"
+        data = tuple(ord(c) if 32 <= ord(c) < 127 else 63 for c in text[:60])
+        self._send_midi((0xF0, STATUS_SYSEX_ID, ord(kind)) + data + (0xF7,))
 
     def _send_color(self, track):
         # track.color is 0xRRGGBB; send 7-bit channels, bridge scales back to 8-bit
@@ -418,16 +432,20 @@ class DualSenseArturia(ControlSurface):
             return
         span = param.max - param.min
         param.value = max(param.min, min(param.max, param.value + (value - 64) * KNOB_STEP * span))
-        self.show_message("%s  |  %s: %s" % (track.name, param.name, param.str_for_value(param.value)))
+        shown = param.str_for_value(param.value)
+        self.show_message("%s  |  %s: %s" % (track.name, param.name, shown))
+        self._send_status("V", "%s|%s|%s" % (track.name, param.name, shown))
 
     def _dsa_pin(self, value):
         if value:
             self._pinned = self.song().view.selected_track
             self.show_message("Pinned: %s" % self._pinned.name)
+            self._send_status("P", self._pinned.name)
 
     def _dsa_unpin(self, value):
         if value:
             self._pinned = None
+            self._send_status("P", "")
 
     def _dsa_page(self, index, value):
         if not value:

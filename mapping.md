@@ -126,6 +126,12 @@ CC value = 64 + step. Parameter p: 0 = volume, 1-8 = Macro 1-8 of the track's fi
 
 Notes on channel 11: 1 pin selected track, 2 unpin, 10-13 page changed (status), 20-28 MIX parameter changed (status). Numbers live in `knobs.py`; `tests/test_knobs.py` checks the Live script uses the same ones.
 
+## Phone display feedback, Live to bridge
+
+SysEx on the `ps5_feedback` port: `F0 7D <kind> <ASCII text> F7`. Kinds: `T` selected track name,
+`P` pinned track name (empty = none), `V` value change as `track|parameter|value`. The bridge
+serves them, with the knob page, at `http://<pc-ip>:8765`.
+
 ## Controller indices
 
 Controllers are told apart by name (`DualSense`, `PS5`, `PlayStation` or `Xbox`). Button and axis

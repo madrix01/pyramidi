@@ -22,6 +22,7 @@ os.environ.setdefault("SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS", "1")
 import mido
 import pygame
 
+import display
 import knobs
 
 # Port names are matched by prefix: Windows appends an index ("ps5_midi 6")
@@ -30,6 +31,12 @@ OUT_PORT_PREFIX = "ps5_midi"
 MINILAB_PORT_PREFIX = "Minilab3 MIDI"
 # Live's script sends the selected track's color here (set as the script's Output in Live)
 FEEDBACK_PORT_PREFIX = "ps5_feedback"
+# Phone app (android/) in USB MIDI mode. Android usually shows up as "MIDI function"; any output port
+# whose name contains one of these (case-insensitive) is treated as the phone. Add your phone's
+# name here if it isn't found (the bridge prints all ports while it's looking).
+PHONE_PORT_HINTS = ("midi function", "android", "pixel", "galaxy", "samsung", "xiaomi", "redmi", "oneplus",
+                    "motorola", "moto ", "nokia", "realme", "oppo", "vivo", "phone")
+PHONE_HEARTBEAT = 2.0  # seconds; the app warns after 5 s of silence
 
 # MiniLab 3 knobs
 KNOB_CHANNEL = 0  # MIDI channel 1
@@ -177,18 +184,27 @@ class Lightbar:
 
 
 class ColorFeedback:
-    """Collects R/G/B CCs from Live on rtmidi's thread; main loop applies them."""
+    """Feedback from Live, on rtmidi's thread: R/G/B CCs for the lightbar (applied by the main
+    loop) and SysEx status text (track names, values) for the phone display."""
 
-    def __init__(self):
+    def __init__(self, state):
         self._rgb = list(IDLE_COLOR)
+        self._state = state
         self.pending = None
 
     def on_message(self, msg):
+        if msg.type == "sysex":
+            status = display.parse_status(msg.data)
+            if status is not None:
+                field, text = status
+                self._state.update(**{field: text})
+            return
         if msg.type != "control_change" or msg.channel != NAV_CHANNEL or msg.control not in COLOR_CCS:
             return
         self._rgb[COLOR_CCS.index(msg.control)] = min(255, msg.value * 2)
         if msg.control == COLOR_CCS[-1]:  # blue arrives last: color is complete
             self.pending = tuple(self._rgb)
+            self._state.update(color="#%02x%02x%02x" % self.pending)
 
 
 def open_feedback(feedback):
@@ -201,7 +217,61 @@ def open_feedback(feedback):
     return mido.open_input(name, callback=feedback.on_message)
 
 
-def open_minilab(out):
+class PhoneLink(threading.Thread):
+    """Sends the display state to the phone app as SysEx on every change and every
+    PHONE_HEARTBEAT seconds. Finds the phone's port by name and reconnects after a replug."""
+
+    def __init__(self, state):
+        super().__init__(daemon=True)
+        self._state = state
+        self._port = None
+        self._next_scan = 0.0
+        self._announced_search = False
+
+    def _find_port(self):
+        for name in mido.get_output_names():
+            if any(hint in name.lower() for hint in PHONE_PORT_HINTS):
+                return name
+        return None
+
+    def run(self):
+        version, last_sent = -1, 0.0
+        while True:
+            if self._port is None and time.monotonic() >= self._next_scan:
+                self._next_scan = time.monotonic() + 3
+                name = self._find_port()
+                if name is not None:
+                    try:
+                        self._port = mido.open_output(name)
+                        print(f"Phone: {name}")
+                        self._state.set_controller("phone", True)
+                        last_sent = 0.0  # send right away
+                    except (IOError, OSError) as exc:
+                        print(f"Phone port {name} found but not opened: {exc}")
+                elif not self._announced_search:
+                    self._announced_search = True
+                    print("Phone app: not connected (set the phone's USB mode to MIDI). Output ports:",
+                          mido.get_output_names())
+
+            new_version, snapshot = self._state.wait(version, 1.0)
+            due = new_version != version or time.monotonic() - last_sent >= PHONE_HEARTBEAT
+            version = new_version
+            if self._port is not None and due:
+                try:
+                    # Windows may accept writes to an unplugged device silently: check it still exists
+                    if self._port.name not in mido.get_output_names():
+                        raise IOError("port gone")
+                    self._port.send(mido.Message("sysex", data=display.snapshot_sysex(snapshot)))
+                    last_sent = time.monotonic()
+                except (IOError, OSError, ValueError):
+                    print("Phone disconnected. Waiting...")
+                    self._port.close()
+                    self._port = None
+                    self._announced_search = False
+                    self._state.set_controller("phone", False)
+
+
+def open_minilab(out, state):
     name = find_port(mido.get_input_names(), MINILAB_PORT_PREFIX)
     if name is None:
         print(f"MiniLab not found (looked for '{MINILAB_PORT_PREFIX}*'). "
@@ -220,6 +290,10 @@ def open_minilab(out):
             else:
                 out.tap(number, knobs.MACRO_CHANNEL)
 
+    def show_page():
+        param = "Volume" if pages.mix_param == knobs.VOLUME else f"Macro {pages.mix_param}"
+        state.update(page=pages.page, mix_param=param)
+
     def forward(msg):
         if msg.type == "control_change" and msg.channel == KNOB_CHANNEL:
             if msg.control in knob_index:
@@ -227,15 +301,20 @@ def open_minilab(out):
                 send(pages.knob(i, decoder.step(i, msg.value) * KNOB_SPEED))
             elif msg.control == ENCODER_CC:
                 send(pages.turn(knobs.decode_relative(msg.value, "relative_offset")))
+                show_page()
             elif msg.control == ENCODER_CLICK_CC and msg.value > 0:
                 send(pages.press())
+                show_page()
                 print(f"Knob page: {pages.page}")
         elif (msg.type in ("note_on", "note_off") and msg.channel == PAD_SOURCE_CHANNEL
               and msg.note in BANK_B_NOTES):
             out.send(msg.copy(channel=PAD_FORWARD_CHANNEL))
 
+    # The bridge always starts on DEVICE: clear any pin Live's script kept from a previous run
+    send([("note", knobs.UNPIN_NOTE)])
     port = mido.open_input(name, callback=forward)
     print(f"MiniLab: {name}")
+    state.set_controller("MiniLab", True)
     return port
 
 
@@ -334,7 +413,7 @@ def send_volume(state, out, now):
     out.send(mido.Message("control_change", control=VOLUME_CC, value=value, channel=NAV_CHANNEL))
 
 
-def run(out, lightbar, feedback):
+def run(out, lightbar, feedback, state):
     joysticks = {}   # instance_id -> Joystick (must stay referenced or SDL closes it)
     kinds = {}       # instance_id -> "dualsense" | "xbox"
     dualsense = DualSenseState()
@@ -353,6 +432,7 @@ def run(out, lightbar, feedback):
                 joysticks[js.get_instance_id()] = js
                 kinds[js.get_instance_id()] = kind
                 print(f"{kind}: {js.get_name()}")
+                state.set_controller(kind, True)
                 if kind == "dualsense":
                     lightbar.attach(event.device_index)
                     lightbar.set(IDLE_COLOR)
@@ -368,6 +448,7 @@ def run(out, lightbar, feedback):
                     xbox = XboxState()
                 if kind is not None:
                     print(f"{kind} disconnected. Waiting...")
+                    state.set_controller(kind, False)
 
             elif hasattr(event, "instance_id"):
                 kind = kinds.get(event.instance_id)
@@ -394,16 +475,22 @@ def main():
     out = Output(mido.open_output(out_name))
     print(f"Output: {out_name}")
 
-    minilab = open_minilab(out)
+    state = display.DisplayState()
+    server = display.start_server(state)
+    for address in display.lan_addresses() or ["<this-pc-ip>"]:
+        print(f"Display: http://{address}:{display.PORT}")
+
+    PhoneLink(state).start()
+    minilab = open_minilab(out, state)
 
     pygame.init()
     pygame.joystick.init()
     lightbar = Lightbar()
-    feedback = ColorFeedback()
+    feedback = ColorFeedback(state)
     feedback_port = open_feedback(feedback)
     print("Bridge running. Ctrl+C to stop.")
     try:
-        run(out, lightbar, feedback)
+        run(out, lightbar, feedback, state)
     except KeyboardInterrupt:
         print("Stopped.")
     finally:
@@ -411,6 +498,7 @@ def main():
             if port is not None:
                 port.close()
         out.close()
+        server.shutdown()
         pygame.quit()
 
 
