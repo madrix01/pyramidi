@@ -7,9 +7,9 @@ with bridge.py (they run in different Python runtimes and can't share a module).
 Behaviour:
 - Nav notes from the DualSense select the previous/next visible track. Selection
   only; transport and clips are never touched.
-- Whenever the selected track changes (joystick, mouse, anything), the 8 knobs are
-  tracked against Macro 1-8 of the first rack on that track, with pickup: a knob is
-  ignored until it crosses the macro's current value, then it controls it.
+- MiniLab knobs arrive as steps (+n / -n) addressed to the selected track, the pinned track
+  or a track to the right of the selected one (bridge.py / knobs.py decide which, per knob
+  page). Each step is added to the parameter's current value, so nothing ever jumps.
 """
 import Live
 from _Framework.ButtonElement import ButtonElement
@@ -17,12 +17,21 @@ from _Framework.ControlSurface import ControlSurface
 from _Framework.EncoderElement import EncoderElement
 from _Framework.InputControlElement import MIDI_CC_TYPE, MIDI_NOTE_TYPE
 
-# MiniLab 3 knobs (forwarded unchanged by bridge.py)
-KNOB_CHANNEL = 0  # MIDI channel 1
-KNOB_CCS = (74, 71, 76, 77, 93, 18, 19, 16)
-# Knobs must send absolute 0-127 values. After a track change a knob only takes over
-# its macro once it reaches the macro's current value (pickup), so sounds never jump.
-PICKUP_TOLERANCE = 2  # knob units (0-127) counted as "reached the macro"
+# MiniLab knob steps from bridge.py. Same numbers as knobs.py (separate runtime, can't import it).
+# CC value is 64 + step. Parameter p: 0 = track volume, 1-8 = Macro 1-8 of the first rack.
+MACRO_CHANNEL = 10  # MIDI channel 11
+SELECTED_BASE = 0   # CC SELECTED_BASE + p: selected track
+PINNED_BASE = 16    # CC PINNED_BASE + p: pinned track
+MIX_BASE = 32       # CC MIX_BASE + k * MIX_STRIDE + p: track k places right of the selected one
+MIX_STRIDE = 10
+MIX_TRACKS = 8
+PARAMS = 9  # volume + 8 macros
+PIN_NOTE = 1        # pin the selected track
+UNPIN_NOTE = 2
+PAGE_NOTE_BASE = 10  # + page index, status message only
+PAGE_NAMES = ("DEVICE", "SPLIT", "LINK", "MIX")
+MIX_PARAM_NOTE_BASE = 20  # + p, status message only
+KNOB_STEP = 1.0 / 127  # one step = 1/127 of a parameter's range
 
 # DualSense navigation (sent by bridge.py)
 NAV_CHANNEL = 15  # MIDI channel 16
@@ -80,10 +89,7 @@ class DualSenseArturia(ControlSurface):
         super().__init__(c_instance)
         self._watched_track = None
         self._held_device_on = None  # Device On parameter switched on by pad 2
-        self._macros = [None] * len(KNOB_CCS)
-        self._knob_pos = [None] * len(KNOB_CCS)   # last CC value seen per knob
-        self._picked = [False] * len(KNOB_CCS)
-        self._last_set = [None] * len(KNOB_CCS)   # last value we wrote, in knob units
+        self._pinned = None  # track pinned by the split page
         with self.component_guard():
             self._create_controls()
         self.song().view.add_selected_track_listener(self._dsa_selected_track_changed)
@@ -92,16 +98,27 @@ class DualSenseArturia(ControlSurface):
         self.show_message("DualSenseArturia loaded")
 
     def _create_controls(self):
-        self._encoders = [
-            EncoderElement(MIDI_CC_TYPE, KNOB_CHANNEL, cc, Live.MidiMap.MapMode.absolute)
-            for cc in KNOB_CCS
-        ]
-        # Not mapped to a parameter: the script receives the raw CC and applies pickup itself
-        self._knob_callbacks = []
-        for i, encoder in enumerate(self._encoders):
-            callback = lambda value, i=i: self._dsa_knob(i, value)
-            self._knob_callbacks.append(callback)
-            encoder.add_value_listener(callback)
+        # Knob steps and page messages: (element, callback) pairs, kept for disconnect()
+        self._knob_listeners = []
+        targets = [(SELECTED_BASE, "selected"), (PINNED_BASE, "pinned")]
+        targets += [(MIX_BASE + k * MIX_STRIDE, k) for k in range(MIX_TRACKS)]
+        for base, target in targets:
+            for p in range(PARAMS):
+                encoder = EncoderElement(
+                    MIDI_CC_TYPE, MACRO_CHANNEL, base + p, Live.MidiMap.MapMode.absolute
+                )
+                callback = lambda value, target=target, p=p: self._dsa_step(target, p, value)
+                encoder.add_value_listener(callback)
+                self._knob_listeners.append((encoder, callback))
+        notes = [(PIN_NOTE, self._dsa_pin), (UNPIN_NOTE, self._dsa_unpin)]
+        notes += [(PAGE_NOTE_BASE + i, lambda value, i=i: self._dsa_page(i, value))
+                  for i in range(len(PAGE_NAMES))]
+        notes += [(MIX_PARAM_NOTE_BASE + p, lambda value, p=p: self._dsa_mix_param(p, value))
+                  for p in range(PARAMS)]
+        for note, callback in notes:
+            button = ButtonElement(True, MIDI_NOTE_TYPE, MACRO_CHANNEL, note)
+            button.add_value_listener(callback)
+            self._knob_listeners.append((button, callback))
         self._volume_encoder = EncoderElement(
             MIDI_CC_TYPE, NAV_CHANNEL, VOLUME_CC, Live.MidiMap.MapMode.absolute
         )
@@ -315,7 +332,7 @@ class DualSenseArturia(ControlSurface):
     def _dsa_selected_track_changed(self):
         track = self.song().view.selected_track
         self._watch_devices(track)
-        self._bind_knobs(track)
+        self._show_rack(track)
         self._send_color(track)
 
     def _dsa_refresh(self, value):
@@ -352,17 +369,10 @@ class DualSenseArturia(ControlSurface):
             pass  # track was deleted; Live already dropped its listeners
 
     def _dsa_devices_changed(self):
-        self._bind_knobs(self.song().view.selected_track)
+        self._show_rack(self.song().view.selected_track)
 
-    def _bind_knobs(self, track):
+    def _show_rack(self, track):
         rack = find_rack(track) if hasattr(track, "devices") else None
-        # parameters[0] is "Device On"; 1..16 are the macros
-        params = list(rack.parameters) if rack is not None else []
-        for i in range(len(KNOB_CCS)):
-            self._macros[i] = params[i + 1] if i + 1 < len(params) else None
-            self._picked[i] = False
-            self._last_set[i] = None
-
         if rack is None:
             self.show_message("%s: no rack, knobs unassigned" % track.name)
         else:
@@ -370,36 +380,76 @@ class DualSenseArturia(ControlSurface):
             self.song().view.select_device(rack)
             self.show_message("%s  |  %s" % (track.name, rack.name))
 
-    def _dsa_knob(self, i, value):
-        previous, self._knob_pos[i] = self._knob_pos[i], value
-        param = self._macros[i]
+    # ---------- knob steps ----------
+
+    def _target_track(self, target):
+        song = self.song()
+        if target == "selected":
+            return song.view.selected_track
+        if target == "pinned":
+            try:
+                return self._pinned if self._pinned in list(song.tracks) else None
+            except RuntimeError:
+                return None  # pinned track was deleted
+        tracks = list(song.visible_tracks)
+        try:
+            index = tracks.index(song.view.selected_track) + target
+        except ValueError:
+            return None  # master/return selected
+        return tracks[index] if index < len(tracks) else None
+
+    def _target_param(self, track, p):
+        if p == 0:
+            return track.mixer_device.volume if hasattr(track, "mixer_device") else None
+        rack = find_rack(track) if hasattr(track, "devices") else None
+        if rack is None:
+            return None
+        params = rack.parameters  # parameters[0] is "Device On"; 1..16 are the macros
+        return params[p] if p < len(params) else None
+
+    def _dsa_step(self, target, p, value):
+        track = self._target_track(target)
+        if track is None:
+            if target == "pinned":
+                self.show_message("No track pinned: enter SPLIT to pin the selected track")
+            return
+        param = self._target_param(track, p)
         if param is None:
             return
         span = param.max - param.min
-        current = (param.value - param.min) / span * 127.0
+        param.value = max(param.min, min(param.max, param.value + (value - 64) * KNOB_STEP * span))
+        self.show_message("%s  |  %s: %s" % (track.name, param.name, param.str_for_value(param.value)))
 
-        # Macro changed elsewhere (automation, mouse): require pickup again
-        if self._picked[i] and abs(current - self._last_set[i]) > PICKUP_TOLERANCE:
-            self._picked[i] = False
+    def _dsa_pin(self, value):
+        if value:
+            self._pinned = self.song().view.selected_track
+            self.show_message("Pinned: %s" % self._pinned.name)
 
-        if not self._picked[i]:
-            crossed = previous is not None and (previous - current) * (value - current) <= 0
-            if abs(value - current) > PICKUP_TOLERANCE and not crossed:
-                return
-            self._picked[i] = True
+    def _dsa_unpin(self, value):
+        if value:
+            self._pinned = None
 
-        param.value = param.min + value / 127.0 * span
-        self._last_set[i] = value
-        self.show_message("%s  |  %s: %s" % (
-            self.song().view.selected_track.name, param.name, param.str_for_value(param.value)))
+    def _dsa_page(self, index, value):
+        if not value:
+            return
+        name = PAGE_NAMES[index]
+        pinned = self._target_track("pinned")
+        if name in ("SPLIT", "LINK") and pinned is not None:
+            self.show_message("Knobs: %s  |  pinned: %s" % (name, pinned.name))
+        else:
+            self.show_message("Knobs: %s" % name)
+
+    def _dsa_mix_param(self, p, value):
+        if value:
+            self.show_message("Knobs: MIX  |  %s" % ("Volume" if p == 0 else "Macro %d" % p))
 
     def disconnect(self):
         view = self.song().view
         if view.selected_track_has_listener(self._dsa_selected_track_changed):
             view.remove_selected_track_listener(self._dsa_selected_track_changed)
         self._unwatch_devices()
-        for encoder, callback in zip(self._encoders, self._knob_callbacks):
-            encoder.remove_value_listener(callback)
+        for element, callback in self._knob_listeners:
+            element.remove_value_listener(callback)
         self._volume_encoder.remove_value_listener(self._dsa_volume)
         self._prev_button.remove_value_listener(self._dsa_prev)
         self._next_button.remove_value_listener(self._dsa_next)

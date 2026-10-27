@@ -3,8 +3,9 @@ DualSense + MiniLab 3 -> loopMIDI -> DualSenseArturia Remote Script (Live 12).
 
 - Left stick up/down: one previous/next track tap per flick.
 - Buttons / D-pad: note on/off on NAV_CHANNEL, for MIDI-mapping clips/scenes in Live.
-- MiniLab 3 knobs: the 8 knob CCs are forwarded unchanged; everything else is ignored
-  (keys/pads reach Live directly through the MiniLab's own port).
+- MiniLab 3 knobs: turned into steps and routed by the active knob page (see knobs.py).
+  Main encoder press cycles pages, turn picks the mix parameter. Bank B pads are forwarded;
+  keys and Bank A pads reach Live directly through the MiniLab's own port.
 
 Keep the channel/note/CC constants in sync with
 remote_script/DualSenseArturia/DualSenseArturia.py.
@@ -21,6 +22,8 @@ os.environ.setdefault("SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS", "1")
 import mido
 import pygame
 
+import knobs
+
 # Port names are matched by prefix: Windows appends an index ("ps5_midi 6")
 # that can differ between input/output lists and between reboots.
 OUT_PORT_PREFIX = "ps5_midi"
@@ -31,6 +34,12 @@ FEEDBACK_PORT_PREFIX = "ps5_feedback"
 # MiniLab 3 knobs
 KNOB_CHANNEL = 0  # MIDI channel 1
 KNOB_CCS = (74, 71, 76, 77, 93, 18, 19, 16)
+# "absolute" (MiniLab factory setting) or, after switching the knobs to relative in MIDI Control
+# Center, the matching relative mode: "relative_offset", "relative_twos" or "relative_signed".
+KNOB_MODE = "relative_offset"  # MiniLab knobs set to relative: 65 = one click right, 63 = left
+KNOB_SPEED = 2  # macro units (of 127) per knob click
+ENCODER_CC = 114        # main encoder turn, relative (64 = center)
+ENCODER_CLICK_CC = 115  # main encoder press, 127 down / 0 up
 
 # Bank B pads (notes 44-51 on channel 10) are forwarded to Live's script on their own channel.
 # Bank A (notes 36-43, drums) is never forwarded: Live receives it directly from the MiniLab.
@@ -199,11 +208,28 @@ def open_minilab(out):
               "Running with DualSense only.")
         return None
 
-    knobs = set(KNOB_CCS)
+    knob_index = {cc: i for i, cc in enumerate(KNOB_CCS)}
+    decoder = knobs.KnobDecoder(KNOB_MODE)
+    pages = knobs.KnobPages()
+
+    def send(messages):
+        for kind, number, *value in messages:
+            if kind == "cc":
+                out.send(mido.Message("control_change", channel=knobs.MACRO_CHANNEL,
+                                      control=number, value=value[0]))
+            else:
+                out.tap(number, knobs.MACRO_CHANNEL)
 
     def forward(msg):
-        if msg.type == "control_change" and msg.channel == KNOB_CHANNEL and msg.control in knobs:
-            out.send(msg)
+        if msg.type == "control_change" and msg.channel == KNOB_CHANNEL:
+            if msg.control in knob_index:
+                i = knob_index[msg.control]
+                send(pages.knob(i, decoder.step(i, msg.value) * KNOB_SPEED))
+            elif msg.control == ENCODER_CC:
+                send(pages.turn(knobs.decode_relative(msg.value, "relative_offset")))
+            elif msg.control == ENCODER_CLICK_CC and msg.value > 0:
+                send(pages.press())
+                print(f"Knob page: {pages.page}")
         elif (msg.type in ("note_on", "note_off") and msg.channel == PAD_SOURCE_CHANNEL
               and msg.note in BANK_B_NOTES):
             out.send(msg.copy(channel=PAD_FORWARD_CHANNEL))

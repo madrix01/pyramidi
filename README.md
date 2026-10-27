@@ -17,8 +17,10 @@ Xbox controller:
 MiniLab 3 pads: Bank A plays drums. Bank B pad 1 toggles the selected track's instrument
 (rack Device On) on/off, pad 2 holds it on while pressed.
 
-MiniLab 3 knobs 1-8: Macro 1-8 of the first rack on the selected track, with pickup
-(a knob does nothing until it reaches the macro's current value, so sounds never jump).
+MiniLab 3 knobs 1-8: knob pages, cycled with the main encoder press. DEVICE (Macro 1-8 of the
+selected track), SPLIT (1-4 selected track, 5-8 a pinned track), LINK (each knob moves the same
+macro on both), MIX (one parameter across 8 tracks). Knobs move parameters by steps, so nothing
+jumps. Details in `mapping.md`.
 
 Controllers are told apart by name (see `classify` in `bridge.py`). Button and axis indices come
 from `uv run tools/discover.py pad`; edit the tables at the top of `bridge.py` if yours differ.
@@ -26,7 +28,7 @@ from `uv run tools/discover.py pad`; edit the tables at the top of `bridge.py` i
 ```
 DualSense ─┐
            ├─ bridge.py ─ loopMIDI "ps5_midi" ─ DualSenseArturia Remote Script
-MiniLab 3 ─┘ (knob CCs only)
+MiniLab 3 ─┘ (knob steps, encoder, Bank B pads)
 MiniLab 3 keys/pads ─ "Minilab3 MIDI" ─ Live tracks (direct)
 ```
 

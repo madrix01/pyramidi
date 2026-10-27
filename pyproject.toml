@@ -9,3 +9,7 @@ dependencies = [
     "pygame>=2.6.1",
     "python-rtmidi>=1.5.8",
 ]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]

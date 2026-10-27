@@ -41,16 +41,31 @@ selected scene (Xbox left stick, or DualSense up/down in session view).
 
 | Control | Action |
 |---|---|
-| Knobs 1-8 | Macro 1-8 of the first rack on the selected track, with pickup |
+| Knobs 1-8 | Depends on the knob page, see below |
+| Main encoder, press | Next knob page: DEVICE, SPLIT, LINK, MIX |
+| Main encoder, turn | MIX page: pick the parameter (Volume, Macro 1-8). Other pages: nothing |
 | Keys | Play the armed track directly (not through Python) |
 | Pad Bank A, pads 1-8 | Drums. Straight to Live, notes 36-43 on channel 10 |
 | Pad Bank B, pad 1 | Toggle the selected track's instrument (first rack's Device On) on/off |
 | Pad Bank B, pad 2 | Hold: instrument on while pressed, off on release |
 | Pad Bank B, pads 3-8 | Not used yet |
 
-Pickup: after a track change a knob does nothing until it reaches the macro's current value
-(`PICKUP_TOLERANCE`, default 2 of 127), so sounds never jump. If a macro is changed elsewhere
-(automation, mouse), that knob needs to pick it up again.
+Knobs never set absolute values: each turn becomes a step added to the parameter's current
+value, so nothing jumps when the target changes. Main encoder press cycles the knob page:
+
+| Page | Knobs |
+|---|---|
+| DEVICE (start) | 1-8 = Macro 1-8 of the selected track |
+| SPLIT | 1-4 = Macro 1-4 of the selected track, 5-8 = Macro 1-4 of the pinned track. Entering SPLIT pins the track selected at that moment |
+| LINK | Knob N = Macro N of the selected and the pinned track together |
+| MIX | Knob N = one parameter of track N, counting from the selected track. Main encoder turn picks the parameter: Volume, Macro 1-8 |
+
+Returning to DEVICE unpins. To pin a different track, cycle back round to SPLIT with that track
+selected. The Live status bar shows the page, pinned track and every value change.
+
+`KNOB_MODE` in `bridge.py` must match the MiniLab: `"absolute"` (factory setting; a knob stops
+at its end) or a relative mode after switching the knobs to relative in MIDI Control Center
+(recommended, knobs turn without limit).
 
 ## MIDI messages
 
@@ -96,7 +111,20 @@ Ch. 1 only.
 
 ### MiniLab 3, channel 1
 
-CC 74, 71, 76, 77, 93, 18, 19, 16 for knobs 1-8. The bridge forwards only these, unchanged.
+CC 74, 71, 76, 77, 93, 18, 19, 16 for knobs 1-8, CC 114 main encoder turn, CC 115 press.
+The bridge turns them into knob steps (below); none reach Live unchanged.
+
+### Knob steps, bridge to Live, channel 11
+
+CC value = 64 + step. Parameter p: 0 = volume, 1-8 = Macro 1-8 of the track's first rack.
+
+| CC | Target |
+|---|---|
+| 0 + p | Selected track |
+| 16 + p | Pinned track |
+| 32 + 10k + p | Track k places right of the selected one (k = 0-7, MIX page) |
+
+Notes on channel 11: 1 pin selected track, 2 unpin, 10-13 page changed (status), 20-28 MIX parameter changed (status). Numbers live in `knobs.py`; `tests/test_knobs.py` checks the Live script uses the same ones.
 
 ## Controller indices
 
