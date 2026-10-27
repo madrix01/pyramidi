@@ -58,11 +58,18 @@ def minilab():
     if name is None:
         print("MiniLab not found. Inputs:", names)
         return
-    print(f"Listening on {name}. Turn each knob 1-8 in order. Ctrl+C to quit.")
+    print(f"Listening on {name}. Turn knobs, turn and click the main encoder, press pads. Ctrl+C to quit.")
+    # Poll instead of `for msg in port`: a blocking read can't be interrupted by Ctrl+C on Windows
     with mido.open_input(name) as port:
-        for msg in port:
-            if msg.type == "control_change":
-                print(f"channel {msg.channel + 1}  CC {msg.control:3d}  value {msg.value:3d}")
+        while True:
+            for msg in port.iter_pending():
+                if msg.type == "control_change":
+                    print(f"channel {msg.channel + 1}  CC {msg.control:3d}  value {msg.value:3d}")
+                elif msg.type in ("note_on", "note_off"):
+                    print(f"channel {msg.channel + 1}  {msg.type:8s} note {msg.note:3d}  velocity {msg.velocity:3d}")
+                elif msg.type in ("program_change", "pitchwheel", "aftertouch", "polytouch"):
+                    print(f"channel {msg.channel + 1}  {msg}")
+            time.sleep(0.005)
 
 
 if __name__ == "__main__":

@@ -3,16 +3,19 @@
 DualSense + MiniLab 3 performance rig for Ableton Live 12 (Windows, loopMIDI).
 
 DualSense:
-- Left stick: previous/next track. Up/down in the arrangement view, left/right in the session view.
+- Left stick, arrangement view: up/down = previous/next track.
+- Left stick, session view: left/right = previous/next track, up/down = select previous/next clip on the
+  selected track (selection only, skips empty slots).
 - Right stick up/down: volume of the selected track (rate control, speed follows deflection).
-- Circle: toggle the selected track's instrument (rack Device On) on/off.
-- Triangle: hold to switch the instrument on, release to switch it off.
 - Lightbar: color of the selected track.
 
 Xbox controller:
-- Left stick up/down: scene up/down. B launches the selected scene.
+- Left stick up/down: scene up/down. B launches the selected clip (single clip, not the scene).
 - X play, Y pause, A stop (Live has no true pause: it stops and keeps the position).
 - Back: stop clips on the selected track.
+
+MiniLab 3 pads: Bank A plays drums. Bank B pad 1 toggles the selected track's instrument
+(rack Device On) on/off, pad 2 holds it on while pressed.
 
 MiniLab 3 knobs 1-8: Macro 1-8 of the first rack on the selected track, with pickup
 (a knob does nothing until it reaches the macro's current value, so sounds never jump).

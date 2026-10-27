@@ -32,6 +32,12 @@ FEEDBACK_PORT_PREFIX = "ps5_feedback"
 KNOB_CHANNEL = 0  # MIDI channel 1
 KNOB_CCS = (74, 71, 76, 77, 93, 18, 19, 16)
 
+# Bank B pads (notes 44-51 on channel 10) are forwarded to Live's script on their own channel.
+# Bank A (notes 36-43, drums) is never forwarded: Live receives it directly from the MiniLab.
+PAD_SOURCE_CHANNEL = 9    # MiniLab 3 pads send on MIDI channel 10
+PAD_FORWARD_CHANNEL = 12  # MIDI channel 13
+BANK_B_NOTES = range(44, 52)
+
 # DualSense
 NAV_CHANNEL = 15  # MIDI channel 16, keeps clear of the MiniLab on channel 1
 VELOCITY = 100
@@ -40,8 +46,6 @@ TRACK_NEXT_NOTE = 121   # stick down
 TRACK_LEFT_NOTE = 125   # stick left
 TRACK_RIGHT_NOTE = 126  # stick right
 REFRESH_NOTE = 122
-TOGGLE_NOTE = 123  # Circle: toggle the selected track's instrument on/off
-HOLD_NOTE = 124    # Triangle: instrument on while held, off on release
 COLOR_CCS = (20, 21, 22)  # R, G, B
 IDLE_COLOR = (0, 0, 40)   # lightbar until Live reports a track color
 LED_BRIGHTNESS = 1.0
@@ -64,10 +68,11 @@ XBOX_CHANNEL = 14  # MIDI channel 15
 PLAY_NOTE = 0
 PAUSE_NOTE = 1
 STOP_NOTE = 2
-SCENE_LAUNCH_NOTE = 3
+CLIP_LAUNCH_NOTE = 3
 SCENE_UP_NOTE = 4
 SCENE_DOWN_NOTE = 5
 STOP_TRACK_NOTE = 6
+STOP_ALL_NOTE = 7
 XBOX_LEFT_STICK_Y = 1  # up is negative
 
 # Controllers are told apart by name. Anything else is ignored.
@@ -79,16 +84,17 @@ XBOX_BUTTON_TO_NOTE = {
     2: PLAY_NOTE,          # X
     3: PAUSE_NOTE,         # Y
     0: STOP_NOTE,          # A
-    1: SCENE_LAUNCH_NOTE,  # B
+    1: CLIP_LAUNCH_NOTE,  # B
     6: STOP_TRACK_NOTE,    # Back / View
+    5: STOP_ALL_NOTE,      # RB
 }
 
 # DualSense
 BUTTON_TO_NOTE = {
     0: 0,    # Cross
-    1: TOGGLE_NOTE,  # Circle
+    1: 1,    # Circle
     2: 2,    # Square
-    3: HOLD_NOTE,  # Triangle
+    3: 3,    # Triangle
     9: 64,   # L1
     10: 65,  # R1
     7: 68,   # L3
@@ -198,6 +204,9 @@ def open_minilab(out):
     def forward(msg):
         if msg.type == "control_change" and msg.channel == KNOB_CHANNEL and msg.control in knobs:
             out.send(msg)
+        elif (msg.type in ("note_on", "note_off") and msg.channel == PAD_SOURCE_CHANNEL
+              and msg.note in BANK_B_NOTES):
+            out.send(msg.copy(channel=PAD_FORWARD_CHANNEL))
 
     port = mido.open_input(name, callback=forward)
     print(f"MiniLab: {name}")

@@ -26,27 +26,32 @@ PICKUP_TOLERANCE = 2  # knob units (0-127) counted as "reached the macro"
 
 # DualSense navigation (sent by bridge.py)
 NAV_CHANNEL = 15  # MIDI channel 16
-# Left stick changes track: up/down in the arrangement view, left/right in the session view
+# Left stick, arrangement view: up/down change track.
+# Left stick, session view: left/right change track, up/down select the clip on the track.
 TRACK_PREV_NOTE = 120   # stick up
 TRACK_NEXT_NOTE = 121   # stick down
 TRACK_LEFT_NOTE = 125   # stick left
 TRACK_RIGHT_NOTE = 126  # stick right
 REFRESH_NOTE = 122  # bridge sends this on start-up so the lightbar syncs
-TOGGLE_NOTE = 123   # Circle: toggle the selected track's instrument on/off
 
-HOLD_NOTE = 124     # Triangle: instrument on while held, off on release
 
 # Xbox controller: transport + scene navigation (sent by bridge.py)
 XBOX_CHANNEL = 14  # MIDI channel 15
 PLAY_NOTE = 0
 PAUSE_NOTE = 1
 STOP_NOTE = 2
-SCENE_LAUNCH_NOTE = 3
+CLIP_LAUNCH_NOTE = 3
 SCENE_UP_NOTE = 4
 SCENE_DOWN_NOTE = 5
 STOP_TRACK_NOTE = 6
+STOP_ALL_NOTE = 7
 
-# What Circle switches: "device" = the rack's Device On (instrument only, effects after it
+# MiniLab 3 Bank B pads (forwarded by bridge.py from the MiniLab's channel 10, notes 44-51)
+PAD_CHANNEL = 12  # MIDI channel 13
+PAD_TOGGLE_NOTE = 44  # pad 1: toggle the selected track's instrument on/off
+PAD_HOLD_NOTE = 45    # pad 2: instrument on while held, off on release
+
+# What pad 1 switches: "device" = the rack's Device On (instrument only, effects after it
 # keep ringing out) or "track" = track mute (silences the whole track).
 TOGGLE_TARGET = "device"
 
@@ -74,7 +79,7 @@ class DualSenseArturia(ControlSurface):
     def __init__(self, c_instance):
         super().__init__(c_instance)
         self._watched_track = None
-        self._held_device_on = None  # Device On parameter switched on by Triangle
+        self._held_device_on = None  # Device On parameter switched on by pad 2
         self._macros = [None] * len(KNOB_CCS)
         self._knob_pos = [None] * len(KNOB_CCS)   # last CC value seen per knob
         self._picked = [False] * len(KNOB_CCS)
@@ -111,9 +116,9 @@ class DualSenseArturia(ControlSurface):
         self._right_button.add_value_listener(self._dsa_right)
         self._refresh_button = ButtonElement(True, MIDI_NOTE_TYPE, NAV_CHANNEL, REFRESH_NOTE)
         self._refresh_button.add_value_listener(self._dsa_refresh)
-        self._toggle_button = ButtonElement(True, MIDI_NOTE_TYPE, NAV_CHANNEL, TOGGLE_NOTE)
+        self._toggle_button = ButtonElement(True, MIDI_NOTE_TYPE, PAD_CHANNEL, PAD_TOGGLE_NOTE)
         self._toggle_button.add_value_listener(self._dsa_toggle)
-        self._hold_button = ButtonElement(True, MIDI_NOTE_TYPE, NAV_CHANNEL, HOLD_NOTE)
+        self._hold_button = ButtonElement(True, MIDI_NOTE_TYPE, PAD_CHANNEL, PAD_HOLD_NOTE)
         self._hold_button.add_value_listener(self._dsa_hold)
 
         # Xbox controller buttons: (button, callback) pairs, kept for disconnect()
@@ -122,10 +127,11 @@ class DualSenseArturia(ControlSurface):
             (PLAY_NOTE, self._dsa_play),
             (PAUSE_NOTE, self._dsa_pause),
             (STOP_NOTE, self._dsa_stop),
-            (SCENE_LAUNCH_NOTE, self._dsa_scene_launch),
+            (CLIP_LAUNCH_NOTE, self._dsa_clip_launch),
             (SCENE_UP_NOTE, lambda value: self._dsa_scene(-1, value)),
             (SCENE_DOWN_NOTE, lambda value: self._dsa_scene(1, value)),
             (STOP_TRACK_NOTE, self._dsa_stop_track),
+            (STOP_ALL_NOTE, self._dsa_stop_all),
         ):
             button = ButtonElement(True, MIDI_NOTE_TYPE, XBOX_CHANNEL, note)
             button.add_value_listener(callback)
@@ -136,13 +142,22 @@ class DualSenseArturia(ControlSurface):
     def _session_visible(self):
         return self.application().view.is_view_visible("Session")
 
-    # Vertical flicks only act in the arrangement view, horizontal only in the session view
+    # Vertical flicks: change track in the arrangement view, select clip in the session view.
+    # Horizontal flicks only act in the session view (change track).
     def _dsa_prev(self, value):
-        if value and not self._session_visible():
+        if not value:
+            return
+        if self._session_visible():
+            self._select_clip(-1)
+        else:
             self._move_track(-1)
 
     def _dsa_next(self, value):
-        if value and not self._session_visible():
+        if not value:
+            return
+        if self._session_visible():
+            self._select_clip(1)
+        else:
             self._move_track(1)
 
     def _dsa_left(self, value):
@@ -230,11 +245,21 @@ class DualSenseArturia(ControlSurface):
         song.view.selected_scene = scenes[index]
         self.show_message("Scene %d: %s" % (index + 1, scenes[index].name))
 
-    def _dsa_scene_launch(self, value):
+    def _dsa_clip_launch(self, value):
+        if not value:
+            return
+        slot = self.song().view.highlighted_clip_slot
+        # Single clip only. An empty slot is never fired: with a stop button it would stop the track.
+        if slot is None or not slot.has_clip:
+            self.show_message("No clip selected")
+            return
+        slot.fire()
+        self.show_message("Launched: %s" % slot.clip.name)
+
+    def _dsa_stop_all(self, value):
         if value:
-            scene = self.song().view.selected_scene
-            scene.fire()
-            self.show_message("Launched scene: %s" % scene.name)
+            self.song().stop_all_clips()
+            self.show_message("All clips stopped")
 
     def _dsa_stop_track(self, value):
         if not value:
@@ -243,6 +268,28 @@ class DualSenseArturia(ControlSurface):
         if hasattr(track, "stop_all_clips"):
             track.stop_all_clips()
             self.show_message("%s: clips stopped" % track.name)
+
+    def _select_clip(self, direction):
+        """Move the selection to the previous/next clip on the selected track (no launch)."""
+        song = self.song()
+        track = song.view.selected_track
+        if not hasattr(track, "clip_slots"):
+            self.show_message("%s has no clips" % track.name)
+            return
+        slots = list(track.clip_slots)
+        scenes = list(song.scenes)
+        try:
+            index = scenes.index(song.view.selected_scene) + direction
+        except ValueError:
+            index = 0
+
+        while 0 <= index < len(slots):
+            if slots[index].has_clip:
+                song.view.highlighted_clip_slot = slots[index]
+                self.show_message("%s  |  scene %d: %s" % (track.name, index + 1, slots[index].clip.name))
+                return
+            index += direction
+        self.show_message("%s: no more clips" % track.name)
 
     def _move_track(self, direction):
         song = self.song()
